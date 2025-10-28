@@ -1,102 +1,82 @@
 #include <Arduino.h>
 #include <Wire.h>
 
-#define DIR_PIN     4
+#define DIR_PIN     0
+#define STEP_PIN    1
 #define SDA_PIN     8
 #define SCL_PIN     9
-#define ANALOG_PIN  3
 #define AS5600_ADDR 0x36
 
-// ---------- Function Prototypes ----------
-float readAngleI2C();
-float readAngleAnalogRaw();
-float unwrapAngle(float newAngle);
+// Stepper configuration
+const int stepsPerRev = 200;
+const int microsteps = 8;
+const int totalSteps = stepsPerRev * microsteps;  // 1600 steps/rev
 
-// ---------- Global Variables ----------
-float angleOffset = 0.0;
-float prevAngle = 0.0;
-float turns = 0.0;
+// Control parameters
+const float Kp = 2.0;  // proportional gain, tune experimentally
+const float loopDelay = 2; // ms between steps (basic speed control)
 
-// ---------- Setup ----------
 void setup() {
   pinMode(DIR_PIN, OUTPUT);
-  digitalWrite(DIR_PIN, LOW);  // Set rotation direction
+  pinMode(STEP_PIN, OUTPUT);
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Serial.begin(115200);
   delay(200);
-
-  Serial.println("AS5600 I2C + Continuous Analog Angle Output");
-
-  // Stabilize ADC
-  for (int i = 0; i < 10; i++) {
-    analogRead(ANALOG_PIN);
-    delay(10);
-  }
-
-  // --- Calibration ---
-  float angleI2C = readAngleI2C();
-  float angleAnalog = readAngleAnalogRaw();
-  angleOffset = angleI2C - angleAnalog;
-  if (angleOffset < 0) angleOffset += 360.0;
-
-  prevAngle = angleAnalog + angleOffset;
-  if (prevAngle >= 360.0) prevAngle -= 360.0;
-
-  Serial.print("Calibration complete. Offset: ");
-  Serial.println(angleOffset, 2);
+  Serial.println("Closed-loop stepper control using AS5600 I2C encoder");
 }
 
-// ---------- Read I2C Angle ----------
+// Read encoder angle from AS5600 via I2C (0–360°)
 float readAngleI2C() {
   Wire.beginTransmission(AS5600_ADDR);
-  Wire.write(0x0E);
+  Wire.write(0x0E); // angle high byte
   Wire.endTransmission(false);
   Wire.requestFrom(AS5600_ADDR, 2);
 
   if (Wire.available() < 2) return NAN;
 
   uint16_t rawAngle = (Wire.read() << 8) | Wire.read();
-  rawAngle &= 0x0FFF; // 12-bit angle
+  rawAngle &= 0x0FFF; // 12-bit
   return (rawAngle * 360.0) / 4096.0;
 }
 
-// ---------- Read Analog Raw Angle ----------
-float readAngleAnalogRaw() {
-  int rawADC = analogRead(ANALOG_PIN);  // 0–4095 (12-bit)
-  return (rawADC * 360.0) / 4095.0;
+// Send one step pulse
+void stepPulse(bool dir) {
+  digitalWrite(DIR_PIN, dir);
+  digitalWrite(STEP_PIN, HIGH);
+  delayMicroseconds(50); // short pulse
+  digitalWrite(STEP_PIN, LOW);
+  delayMicroseconds(50);
 }
 
-// ---------- Unwrap Continuous Angle ----------
-float unwrapAngle(float newAngle) {
-  float delta = newAngle - prevAngle;
-  if (delta > 180.0)      turns -= 1;   // wrapped backward
-  else if (delta < -180.0) turns += 1;  // wrapped forward
-  prevAngle = newAngle;
-  return newAngle + (turns * 360.0);
-}
-
-// ---------- Main Loop ----------
 void loop() {
-  float angleI2C = readAngleI2C();
-  float analogRaw = readAngleAnalogRaw();
+  static float targetAngle = 180.0; // target in degrees
+  float currentAngle = readAngleI2C();
 
-  // Apply calibration offset
-  float calibratedAngle = analogRaw + angleOffset;
-  if (calibratedAngle >= 360.0) calibratedAngle -= 360.0;
-  if (calibratedAngle < 0.0) calibratedAngle += 360.0;
+  if (isnan(currentAngle)) return;
 
-  // Continuous unwrapped analog angle
-  float continuousAngle = unwrapAngle(calibratedAngle);
+  // Calculate error
+  float error = targetAngle - currentAngle;
 
-  // Output I2C (absolute) + analog (continuous)
-  if (!isnan(angleI2C)) {
-    Serial.print(angleI2C, 2);
-    Serial.print(",");
-    Serial.println(continuousAngle, 2);
-  } else {
-    Serial.println("Error");
+  // Wrap error into -180 to 180
+  if (error > 180.0) error -= 360.0;
+  else if (error < -180.0) error += 360.0;
+
+  // Determine step count using proportional control
+  float stepCommand = Kp * error;  // P controller
+  int stepsToMove = (int)((stepCommand / 360.0) * totalSteps);
+
+  bool dir = stepsToMove >= 0;
+  stepsToMove = abs(stepsToMove);
+
+  for (int i = 0; i < stepsToMove; i++) {
+    stepPulse(dir);
+    delay(loopDelay); // spacing between steps
   }
 
-  delay(50);
+  // Optional: print current and target
+  Serial.print("Target: "); Serial.print(targetAngle);
+  Serial.print(" | Current: "); Serial.println(currentAngle);
+
+  delay(10); // loop delay
 }
